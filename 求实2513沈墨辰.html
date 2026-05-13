@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>绝不回头+8步到终点才算最少</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background-color: #f5f5f5;
+            padding: 20px;
+        }
+        #game-container {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 0 10px #ccc;
+        }
+        #game-board {
+            display: grid;
+            grid-template-columns: repeat(5, 80px);
+            grid-template-rows: repeat(5, 80px);
+            gap: 3px;
+            margin: 20px 0;
+        }
+        .cell {
+            width: 80px;
+            height: 80px;
+            background: #eee;
+            border-radius: 6px;
+            position: relative;
+        }
+        .wall { background: #333; }
+        .start { background: #9eff9e; }
+        .end { background: #ff9e9e; }
+        .agent-mark{
+            position:absolute;
+            width:24px;height:24px;
+            background:#66f;
+            border-radius:50%;
+            top:50%;left:50%;
+            transform:translate(-50%,-50%);
+            z-index:10;
+        }
+        .dir{
+            position:absolute;
+            font-size:18px;
+            color:#333;
+        }
+        .up{ top:4px; left:50%; transform:translateX(-50%); }
+        .down{ bottom:4px; left:50%; transform:translateX(-50%); }
+        .left{ left:4px; top:50%; transform:translateY(-50%); }
+        .right{ right:4px; top:50%; transform:translateY(-50%); }
+
+        #controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        button {
+            padding: 8px 16px;
+            font-size: 16px;
+            border: none;
+            border-radius: 5px;
+            background: #4CAF50;
+            color: white;
+            cursor: pointer;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        #stats {
+            font-size: 16px;
+            margin: 10px 0;
+        }
+        #tip {
+            color:red;
+            font-weight:bold;
+            font-size:18px;
+            margin:8px 0;
+        }
+        #history {
+            margin-top: 15px;
+            max-height: 180px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 10px;
+            width: 380px;
+        }
+    </style>
+</head>
+<body>
+    <h1>✅ 绝不返回上一格 | 8步到终点才算最少</h1>
+    <div id="game-container">
+        <div id="controls">
+            <button id="start-btn">开始学习</button>
+            <button id="pause-btn" disabled>暂停</button>
+            <button id="reset-btn">重置游戏</button>
+        </div>
+        <div id="tip"></div>
+        <div id="game-board"></div>
+        <div id="stats">
+            <p>回合数：<span id="episode-count">0</span></p>
+            <p>当前回合步数：<span id="step-count">0</span></p>
+        </div>
+        <div id="history">
+            <h4>每回合步数记录</h4>
+            <div id="history-list"></div>
+        </div>
+    </div>
+
+    <script>
+        const gridSize = 5;
+        const startPos = {x: 0, y: 0};
+        const endPos = {x: 4, y: 4};
+        const walls = [
+            {x:1,y:1},{x:2,y:1},{x:3,y:1},
+            {x:1,y:3},{x:2,y:3},{x:3,y:3}
+        ];
+
+        const lr = 0.1;
+        const gamma = 0.95;
+        let exploreRate = 1.0;
+        const exploreDecay = 0.995;
+        const minExplore = 0.01;
+        const BEST_STEP = 8;
+
+        let agent = {...startPos};
+        let qTable = {};
+        let forbidDir = {};
+        let lastPos = null; // 上一步坐标
+
+        let episode = 0;
+        let steps = 0;
+        let isRunning = false;
+        let isPaused = false;
+        let timer = null;
+        let stepHistory = [];
+
+        const dirMap = {up: '↑',down: '↓',left: '←',right: '→'};
+        const allDirs = ["up","down","left","right"];
+
+        function initQAndForbid() {
+            qTable = {};
+            forbidDir = {};
+            for(let y = 0; y < gridSize; y++){
+                for(let x = 0; x < gridSize; x++){
+                    if(!isWall(x,y)){
+                        let key = `${x},${y}`;
+                        qTable[key] = {up:0, down:0, left:0, right:0};
+                        forbidDir[key] = [];
+                    }
+                }
+            }
+        }
+
+        function isWall(x,y){ return walls.some(w => w.x === x && w.y === y); }
+        function isOut(x,y){ return x < 0 || x >= gridSize || y < 0 || y >= gridSize; }
+
+        // 可用方向 = 没撞墙的方向
+        function getValidActions(state){
+            return allDirs.filter(d => !forbidDir[state].includes(d));
+        }
+
+        // ==============================================
+        // 核心：永远禁止返回上一格（彻底修复版）
+        // ==============================================
+        function getNoBackActions(valid){
+            if(!lastPos) return valid;
+            let dx = agent.x - lastPos.x;
+            let dy = agent.y - lastPos.y;
+
+            let backDir = "";
+            if(dx === 1) backDir = "left";    // 从左来 → 禁止左
+            if(dx === -1) backDir = "right"; // 从右来 → 禁止右
+            if(dy === 1) backDir = "up";     // 从上来 → 禁止上
+            if(dy === -1) backDir = "down";  // 从下来 → 禁止下
+
+            return valid.filter(d => d !== backDir);
+        }
+
+        function chooseAction(state){
+            let valid = getValidActions(state);
+            valid = getNoBackActions(valid); // 强制不回头
+            if(valid.length === 0) return null;
+
+            if(Math.random() < exploreRate){
+                return valid[Math.floor(Math.random() * valid.length)];
+            }else{
+                let maxQ = -Infinity, best=valid[0];
+                for(let a of valid) if(qTable[state][a]>maxQ){maxQ=qTable[state][a];best=a;}
+                return best;
+            }
+        }
+
+        function takeAction(action){
+            let nx = agent.x, ny = agent.y;
+            switch(action){
+                case "up": ny--; break;
+                case "down": ny++; break;
+                case "left": nx--; break;
+                case "right": nx++; break;
+            }
+
+            if(isOut(nx,ny)||isWall(nx,ny)){
+                let k=`${agent.x},${agent.y}`;
+                if(!forbidDir[k].includes(action)) forbidDir[k].push(action);
+                return {reward:-10,done:false};
+            }
+
+            // 记录上一步
+            lastPos = {x:agent.x, y:agent.y};
+            agent.x = nx; agent.y = ny;
+
+            let done = (nx===endPos.x && ny===endPos.y);
+            return {reward: done?100:-1, done:done};
+        }
+
+        function updateQ(s,a,r,ns){
+            let c=qTable[s][a];
+            let nv=getValidActions(ns);
+            let m=nv.length?Math.max(...nv.map(d=>qTable[ns][d])):0;
+            qTable[s][a]=c+lr*(r+gamma*m -c);
+        }
+
+        function renderBoard(){
+            const b=document.getElementById("game-board");
+            b.innerHTML="";
+            for(let y=0;y<5;y++){
+                for(let x=0;x<5;x++){
+                    let c=document.createElement("div");
+                    c.className="cell";
+                    if(isWall(x,y)) c.classList.add("wall");
+                    else{
+                        let k=`${x},${y}`;
+                        let v=getValidActions(k);
+                        allDirs.forEach(d=>{
+                            if(v.includes(d)){
+                                let s=document.createElement("span");
+                                s.className="dir "+d;
+                                s.textContent=dirMap[d];
+                                c.appendChild(s);
+                            }
+                        });
+                    }
+                    if(x==0&&y==0)c.classList.add("start");
+                    if(x==4&&y==4)c.classList.add("end");
+                    if(x==agent.x&&y==agent.y&&!isWall(x,y)){
+                        let m=document.createElement("div");
+                        m.className="agent-mark";
+                        c.appendChild(m);
+                    }
+                    b.appendChild(c);
+                }
+            }
+        }
+
+        function updateHistoryUI(){
+            let list=document.getElementById("history-list");
+            list.innerHTML="";
+            stepHistory.forEach((st,i)=>{
+                let d=document.createElement("div");
+                d.textContent=`第${i+1}回合：${st}步`;
+                list.appendChild(d);
+            });
+            list.scrollTop=list.scrollHeight;
+        }
+
+        function stopGame(){
+            clearInterval(timer); isRunning=false;
+            document.getElementById("start-btn").disabled=false;
+            document.getElementById("pause-btn").disabled=true;
+            document.getElementById("tip").textContent="✅ 8步到达终点！已找到最少步数，游戏结束！";
+        }
+
+        function runStep(){
+            if(isPaused) return;
+            let s=`${agent.x},${agent.y}`;
+            let a=chooseAction(s);
+            if(!a){endEpisode();return;}
+
+            let {reward,done}=takeAction(a);
+            let ns=`${agent.x},${agent.y}`;
+            updateQ(s,a,reward,ns);
+
+            steps++;
+            document.getElementById("step-count").textContent=steps;
+            renderBoard();
+
+            if(done){
+                stepHistory.push(steps);
+                updateHistoryUI();
+                if(steps===BEST_STEP){stopGame();return;}
+                endEpisode();
+            }
+            if(steps>=30){endEpisode();}
+        }
+
+        function endEpisode(){
+            clearInterval(timer);
+            exploreRate=Math.max(minExplore,exploreRate*exploreDecay);
+            nextEpisode();
+        }
+
+        function nextEpisode(){
+            agent={...startPos}; lastPos=null; steps=0; episode++;
+            document.getElementById("episode-count").textContent=episode;
+            document.getElementById("step-count").textContent=0;
+            document.getElementById("tip").textContent="";
+            renderBoard();
+            timer=setInterval(runStep,200);
+        }
+
+        function startLearning(){
+            if(isRunning)return;
+            isRunning=true; isPaused=false;
+            document.getElementById("start-btn").disabled=true;
+            document.getElementById("pause-btn").disabled=false;
+            nextEpisode();
+        }
+
+        function pauseLearning(){
+            isPaused=!isPaused;
+            document.getElementById("pause-btn").textContent=isPaused?"继续":"暂停";
+        }
+
+        function resetGame(){
+            clearInterval(timer);
+            isRunning=false; isPaused=false;
+            episode=0; steps=0; exploreRate=1.0;
+            stepHistory=[]; agent={...startPos}; lastPos=null;
+            initQAndForbid(); renderBoard();
+            document.getElementById("episode-count").textContent=0;
+            document.getElementById("step-count").textContent=0;
+            document.getElementById("history-list").innerHTML="";
+            document.getElementById("tip").textContent="";
+            document.getElementById("start-btn").disabled=false;
+            document.getElementById("pause-btn").disabled=true;
+            document.getElementById("pause-btn").textContent="暂停";
+        }
+
+        document.getElementById("start-btn").onclick=startLearning;
+        document.getElementById("pause-btn").onclick=pauseLearning;
+        document.getElementById("reset-btn").onclick=resetGame;
+
+        initQAndForbid();
+        renderBoard();
+    </script>
+</body>
+</html>
